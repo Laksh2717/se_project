@@ -4,16 +4,24 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from app.config import get_settings
 
 settings = get_settings()
-engine = create_engine(settings.database_url, connect_args={"check_same_thread": False})
+engine = create_engine(
+    settings.database_url,
+    connect_args={"check_same_thread": False, "timeout": 30},
+    pool_pre_ping=True,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
-with engine.begin() as conn:
-    conn.execute(text("PRAGMA journal_mode=WAL;"))
-    conn.execute(text("PRAGMA synchronous=NORMAL;"))
-    conn.execute(text("PRAGMA busy_timeout = 5000;"))
-    conn.execute(text("PRAGMA foreign_keys = ON;"))
+def configure_sqlite() -> None:
+    with engine.begin() as conn:
+        conn.execute(text("PRAGMA journal_mode=WAL;"))
+        conn.execute(text("PRAGMA synchronous=NORMAL;"))
+        conn.execute(text("PRAGMA busy_timeout = 5000;"))
+        conn.execute(text("PRAGMA foreign_keys = ON;"))
+
+
+configure_sqlite()
 
 
 def init_db() -> None:
