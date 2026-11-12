@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -7,6 +7,10 @@ from app.database import Base
 
 class Wallet(Base):
     __tablename__ = "wallets"
+    __table_args__ = (
+        UniqueConstraint("user_id", "currency", name="uq_wallet_user_currency"),
+        CheckConstraint("balance_minor >= 0 OR is_system = 1", name="ck_wallet_balance_non_negative"),
+    )
 
     id = Column(String, primary_key=True)
     user_id = Column(String, ForeignKey("users.id"), nullable=False)

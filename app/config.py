@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
     database_url: str = "sqlite:///./financial_ledger.db"
     admin_api_key: str = "change-me"
+    sqlite_busy_timeout_ms: int = 5000
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

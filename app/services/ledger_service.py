@@ -1,284 +1,234 @@
+"""Core ledger logic: deposits, transfers, reversals and reconciliation.
+
+Rules this module enforces:
+- Every write method runs inside ONE transaction started with BEGIN IMMEDIATE (see database.make_engine).
+  The first statement of each method is the idempotency lookup, so no balance is read before the lock is held.
+- Every movement of money is a balanced pair of entries (debit + credit). Deposits debit the system funding wallet.
+- Ledger rows are only ever inserted. Mistakes are corrected by reversal transactions.
+"""
+
+import functools
 import json
-import hashlib
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable, NamedTuple
 from uuid import uuid4
 
-from sqlalchemy import func
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
-from app.config import get_settings
-from app.core.errors import ConflictError, InsufficientFundsError, NotFoundError, ValidationError
+from app.core.constants import SUPPORTED_CURRENCIES
+from app.core.errors import (ConflictError, InsufficientFundsError, NotFoundError, UnprocessableError)
+from app.core.hashing import GENESIS_HASH, entry_hash
 from app.models.idempotency_key import IdempotencyKey
 from app.models.ledger_entry import LedgerEntry
 from app.models.ledger_transaction import LedgerTransaction
 from app.models.wallet import Wallet
 
-settings = get_settings()
+
+class Result(NamedTuple):
+    status: int
+    body: dict
+    replayed: bool = False
+
+
+def _atomic(fn):
+    """Roll the whole transaction back if anything goes wrong."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        except BaseException:
+            self.db.rollback()
+            raise
+    return wrapper
 
 
 class LedgerService:
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, clock: Callable[[], datetime] | None = None,
+                 id_generator: Callable[[], str] | None = None):
         self.db = db
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.new_id = id_generator or (lambda: str(uuid4()))
 
-    def _new_txn(self, txn_type: str, amount_minor: int, currency: str, reverses_transaction_id: str | None = None) -> LedgerTransaction:
-        transaction = LedgerTransaction(
-            id=str(uuid4()),
-            type=txn_type,
-            amount_minor=amount_minor,
-            currency=currency.upper(),
-            reverses_transaction_id=reverses_transaction_id,
-            created_at=datetime.now(timezone.utc),
-        )
-        self.db.add(transaction)
+    # ---------------------------------------------------------------- helpers
+    def _replay(self, key: str, request_hash: str) -> Result | None:
+        """Idempotency lookup. Must be the first statement of every write method."""
+        record = self.db.get(IdempotencyKey, key)
+        if record is None:
+            return None
+        self.db.rollback()  # nothing to write: release the write lock
+        if record.request_hash != request_hash:
+            raise UnprocessableError("IDEMPOTENCY_KEY_REUSED", "this Idempotency-Key was already used with a different request")
+        return Result(record.response_status, json.loads(record.response_body), replayed=True)
+
+    def _store(self, key: str, request_hash: str, status: int, body: dict, transaction_id: str) -> None:
+        self.db.add(IdempotencyKey(key=key, request_hash=request_hash, response_status=status,
+                                   response_body=json.dumps(body), transaction_id=transaction_id,
+                                   created_at=self.clock()))
+
+    def _new_txn(self, txn_type: str, amount: int, currency: str, reverses: str | None = None) -> LedgerTransaction:
+        txn = LedgerTransaction(id=self.new_id(), type=txn_type, amount_minor=amount, currency=currency,
+                                reverses_transaction_id=reverses, created_at=self.clock())
+        self.db.add(txn)
         self.db.flush()
-        return transaction
+        return txn
 
-    def _last_entry_hash(self) -> str:
-        row = self.db.query(LedgerEntry).order_by(LedgerEntry.seq.desc()).first()
-        return row.entry_hash if row else "GENESIS"
-
-    def _build_entry_hash(self, prev_hash: str, transaction_id: str, wallet_id: str, direction: str, amount_minor: int, currency: str, created_at: datetime) -> str:
-        payload = "|".join([
-            prev_hash,
-            transaction_id,
-            wallet_id,
-            direction,
-            str(amount_minor),
-            currency,
-            created_at.isoformat(),
-        ])
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-    def _append_ledger_entry(self, transaction: LedgerTransaction, wallet: Wallet, direction: str, amount_minor: int) -> LedgerEntry:
-        prev_hash = self._last_entry_hash()
-        created_at = datetime.now(timezone.utc)
-        entry_hash = self._build_entry_hash(prev_hash, transaction.id, wallet.id, direction, amount_minor, wallet.currency, created_at)
-        entry = LedgerEntry(
-            transaction_id=transaction.id,
-            wallet_id=wallet.id,
-            direction=direction,
-            amount_minor=amount_minor,
-            currency=wallet.currency,
-            prev_hash=prev_hash,
-            entry_hash=entry_hash,
-            created_at=created_at,
-        )
-        self.db.add(entry)
+    def _post(self, txn: LedgerTransaction, wallet: Wallet, direction: str, amount: int) -> None:
+        """Insert one hash-chained ledger entry and move the wallet balance."""
+        if direction == "DEBIT":
+            wallet.balance_minor -= amount
+            if wallet.balance_minor < 0 and not wallet.is_system:
+                raise InsufficientFundsError("insufficient funds")
+        else:
+            wallet.balance_minor += amount
+        prev = self.db.execute(select(LedgerEntry.entry_hash).order_by(LedgerEntry.seq.desc()).limit(1)).scalar() or GENESIS_HASH
+        now = self.clock()
+        self.db.add(LedgerEntry(
+            transaction_id=txn.id, wallet_id=wallet.id, direction=direction, amount_minor=amount,
+            currency=wallet.currency, prev_hash=prev,
+            entry_hash=entry_hash(prev, txn.id, wallet.id, direction, amount, wallet.currency, now),
+            created_at=now))
         self.db.flush()
-        return entry
 
-    def deposit(self, wallet_id: str, amount_minor: int, currency: str) -> dict[str, Any]:
-        if amount_minor <= 0:
-            raise ValidationError("amount_minor must be > 0")
+    def _require_currency(self, currency: str) -> None:
+        if currency not in SUPPORTED_CURRENCIES:
+            raise UnprocessableError("CURRENCY_NOT_SUPPORTED", f"currency must be one of {', '.join(SUPPORTED_CURRENCIES)}")
 
-        wallet = self.db.query(Wallet).filter(Wallet.id == wallet_id).first()
-        if not wallet:
-            raise NotFoundError(f"Wallet {wallet_id} not found")
-        if wallet.currency != currency.upper():
-            raise ValidationError("wallet currency does not match request currency")
+    def _user_wallet(self, wallet_id: str) -> Wallet:
+        wallet = self.db.get(Wallet, wallet_id)
+        if wallet is None:
+            raise NotFoundError(f"wallet {wallet_id} not found")
+        if wallet.is_system:
+            raise UnprocessableError("SYSTEM_WALLET_NOT_ALLOWED", "system wallets cannot be used in this operation")
+        return wallet
 
-        try:
-            transaction = self._new_txn("deposit", amount_minor, currency)
-            wallet.balance_minor += amount_minor
-            self._append_ledger_entry(transaction, wallet, "CREDIT", amount_minor)
-            self.db.flush()
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
-            raise
+    # ---------------------------------------------------------------- writes
+    @_atomic
+    def deposit(self, wallet_id: str, amount: int, currency: str, key: str, request_hash: str) -> Result:
+        if (replay := self._replay(key, request_hash)):
+            return replay
+        self._require_currency(currency)
+        wallet = self._user_wallet(wallet_id)
+        if wallet.currency != currency:
+            raise UnprocessableError("CURRENCY_MISMATCH", "wallet currency does not match the request currency")
+        funding = self.db.execute(select(Wallet).where(Wallet.is_system.is_(True), Wallet.currency == currency)).scalar_one()
+        txn = self._new_txn("deposit", amount, currency)
+        self._post(txn, funding, "DEBIT", amount)
+        self._post(txn, wallet, "CREDIT", amount)
+        body = {"transaction_id": txn.id, "wallet_id": wallet.id, "amount_minor": amount, "currency": currency,
+                "balance_minor": wallet.balance_minor, "status": "success"}
+        self._store(key, request_hash, 201, body, txn.id)
+        self.db.commit()
+        return Result(201, body)
 
-        return {
-            "transaction_id": transaction.id,
-            "wallet_id": wallet.id,
-            "balance_minor": wallet.balance_minor,
-            "status": "success",
-        }
-
-    def transfer(self, source_wallet_id: str, destination_wallet_id: str, amount_minor: int, currency: str, idempotency_key: str, request_hash: str) -> dict[str, Any]:
-        if amount_minor <= 0:
-            raise ValidationError("amount_minor must be > 0")
-        if source_wallet_id == destination_wallet_id:
-            raise ValidationError("source and destination wallets must differ")
-
-        source_wallet = self.db.query(Wallet).filter(Wallet.id == source_wallet_id).first()
-        destination_wallet = self.db.query(Wallet).filter(Wallet.id == destination_wallet_id).first()
-        if not source_wallet or not destination_wallet:
-            raise NotFoundError("source and destination wallets must both exist")
-        if source_wallet.currency != currency.upper() or destination_wallet.currency != currency.upper():
-            raise ValidationError("both wallets must use the same currency")
-        if source_wallet.balance_minor < amount_minor:
+    @_atomic
+    def transfer(self, source_id: str, destination_id: str, amount: int, currency: str, key: str, request_hash: str) -> Result:
+        if (replay := self._replay(key, request_hash)):
+            return replay
+        source = self._user_wallet(source_id)
+        destination = self._user_wallet(destination_id)
+        if source.id == destination.id:
+            raise UnprocessableError("SAME_WALLET", "source and destination wallets must differ")
+        self._require_currency(currency)
+        if source.currency != currency or destination.currency != currency:
+            raise UnprocessableError("CURRENCY_MISMATCH", "both wallets must use the transfer currency")
+        if source.balance_minor < amount:
             raise InsufficientFundsError("source wallet does not have sufficient balance")
+        txn = self._new_txn("transfer", amount, currency)
+        self._post(txn, source, "DEBIT", amount)
+        self._post(txn, destination, "CREDIT", amount)
+        body = {"transaction_id": txn.id, "source_wallet_id": source.id, "destination_wallet_id": destination.id,
+                "amount_minor": amount, "currency": currency, "status": "success"}
+        self._store(key, request_hash, 201, body, txn.id)
+        self.db.commit()
+        return Result(201, body)
 
-        existing = self.db.query(IdempotencyKey).filter(IdempotencyKey.key == idempotency_key).first()
-        if existing:
-            if existing.request_hash != request_hash:
-                raise ConflictError("idempotency key already used with different request payload")
-            response_payload = json.loads(existing.response_body)
-            return {
-                "transaction_id": existing.transaction_id,
-                "status": "replayed",
-                "message": "request replayed with same payload",
-                "response": response_payload,
-            }
+    @_atomic
+    def reverse(self, transaction_id: str, key: str, request_hash: str) -> Result:
+        if (replay := self._replay(key, request_hash)):
+            return replay
+        original = self.db.get(LedgerTransaction, transaction_id)
+        if original is None:
+            raise NotFoundError(f"transaction {transaction_id} not found")
+        if original.type == "reversal":
+            raise ConflictError("a reversal cannot itself be reversed")
+        if self.db.query(LedgerTransaction).filter(LedgerTransaction.reverses_transaction_id == transaction_id).first():
+            raise ConflictError("transaction has already been reversed")
+        entries = self.db.query(LedgerEntry).filter(LedgerEntry.transaction_id == transaction_id).order_by(LedgerEntry.seq).all()
+        reversal = self._new_txn("reversal", original.amount_minor, original.currency, reverses=transaction_id)
+        for entry in entries:
+            wallet = self.db.get(Wallet, entry.wallet_id)
+            self._post(reversal, wallet, "CREDIT" if entry.direction == "DEBIT" else "DEBIT", entry.amount_minor)
+        body = {"transaction_id": reversal.id, "reverses_transaction_id": transaction_id,
+                "amount_minor": original.amount_minor, "currency": original.currency, "status": "success"}
+        self._store(key, request_hash, 201, body, reversal.id)
+        self.db.commit()
+        return Result(201, body)
 
-        try:
-            transaction = self._new_txn("transfer", amount_minor, currency)
-            source_wallet.balance_minor -= amount_minor
-            destination_wallet.balance_minor += amount_minor
-            self._append_ledger_entry(transaction, source_wallet, "DEBIT", amount_minor)
-            self._append_ledger_entry(transaction, destination_wallet, "CREDIT", amount_minor)
-
-            response_payload = {
-                "transaction_id": transaction.id,
-                "source_wallet_id": source_wallet.id,
-                "destination_wallet_id": destination_wallet.id,
-                "amount_minor": amount_minor,
-                "currency": currency.upper(),
-                "status": "success",
-            }
-
-            record = IdempotencyKey(
-                key=idempotency_key,
-                request_hash=request_hash,
-                response_status=200,
-                response_body=json.dumps(response_payload),
-                transaction_id=transaction.id,
-                created_at=datetime.now(timezone.utc),
-            )
-            self.db.add(record)
-            self.db.flush()
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
-            raise
-
-        return response_payload
-
-    def reverse_transaction(self, transaction_id: str, idempotency_key: str, request_hash: str) -> dict[str, Any]:
-        original = self.db.query(LedgerTransaction).filter(LedgerTransaction.id == transaction_id).first()
-        if not original:
-            raise NotFoundError(f"Transaction {transaction_id} not found")
-        if original.type == "reversal" or original.reverses_transaction_id is not None:
-            raise ConflictError("transaction is already reversed or is itself a reversal")
-
-        existing = self.db.query(IdempotencyKey).filter(IdempotencyKey.key == idempotency_key).first()
-        if existing:
-            if existing.request_hash != request_hash:
-                raise ConflictError("idempotency key already used with different request payload")
-            response_payload = json.loads(existing.response_body)
-            return {
-                "transaction_id": existing.transaction_id,
-                "status": "replayed",
-                "message": "reversal replayed with same payload",
-                "response": response_payload,
-            }
-
-        entries = self.db.query(LedgerEntry).filter(LedgerEntry.transaction_id == transaction_id).all()
-        if not entries:
-            raise ValidationError("transaction has no ledger entries to reverse")
-
-        try:
-            reversal_txn = self._new_txn("reversal", original.amount_minor, original.currency, reverses_transaction_id=transaction_id)
-            reversal_payload = {
-                "transaction_id": reversal_txn.id,
-                "reverses_transaction_id": transaction_id,
-                "amount_minor": original.amount_minor,
-                "currency": original.currency,
-                "status": "success",
-            }
-
-            for entry in entries:
-                wallet = self.db.query(Wallet).filter(Wallet.id == entry.wallet_id).first()
-                if not wallet:
-                    raise NotFoundError(f"Wallet {entry.wallet_id} not found")
-
-                target_direction = "CREDIT" if entry.direction == "DEBIT" else "DEBIT"
-                if target_direction == "DEBIT" and wallet.balance_minor < entry.amount_minor:
-                    raise InsufficientFundsError("reversal would make the wallet balance negative")
-
-                wallet.balance_minor += entry.amount_minor if target_direction == "CREDIT" else -entry.amount_minor
-                self._append_ledger_entry(reversal_txn, wallet, target_direction, entry.amount_minor)
-
-            record = IdempotencyKey(
-                key=idempotency_key,
-                request_hash=request_hash,
-                response_status=200,
-                response_body=json.dumps(reversal_payload),
-                transaction_id=reversal_txn.id,
-                created_at=datetime.now(timezone.utc),
-            )
-            self.db.add(record)
-            self.db.flush()
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
-            raise
-
-        return reversal_payload
+    # ---------------------------------------------------------------- reads
+    def get_transfer(self, transfer_id: str) -> dict[str, Any]:
+        txn = self.db.get(LedgerTransaction, transfer_id)
+        if txn is None or txn.type != "transfer":
+            raise NotFoundError(f"transfer {transfer_id} not found")
+        entries = self.db.query(LedgerEntry).filter(LedgerEntry.transaction_id == txn.id).order_by(LedgerEntry.seq).all()
+        return {"id": txn.id, "type": txn.type, "amount_minor": txn.amount_minor, "currency": txn.currency,
+                "reverses_transaction_id": txn.reverses_transaction_id,
+                "created_at": txn.created_at.isoformat() if txn.created_at else None,
+                "entries": [entry_to_dict(e) for e in entries]}
 
     def reconcile(self) -> dict[str, Any]:
-        wallets = self.db.query(Wallet).all()
-        entries = self.db.query(LedgerEntry).order_by(LedgerEntry.seq.asc()).all()
-        transactions = self.db.query(LedgerTransaction).count()
-        discrepancies = []
+        """Read-only integrity check. Run on a read session so all queries share one snapshot."""
+        db = self.db
+        problems: list[dict[str, Any]] = []
 
-        per_transaction = {}
-        for entry in entries:
-            tx_id = entry.transaction_id
-            per_transaction.setdefault(tx_id, {"debits": 0, "credits": 0})
-            if entry.direction == "DEBIT":
-                per_transaction[tx_id]["debits"] += entry.amount_minor
-            elif entry.direction == "CREDIT":
-                per_transaction[tx_id]["credits"] += entry.amount_minor
+        def problem(kind, expected=None, actual=None, **extra):
+            problems.append({"type": kind, "wallet_id": None, "transaction_id": None, "seq": None,
+                             "expected": expected, "actual": actual, **extra})
 
-        for tx_id, totals in per_transaction.items():
-            if totals["debits"] != totals["credits"]:
-                discrepancies.append({
-                    "transaction_id": tx_id,
-                    "type": "transaction_balance_mismatch",
-                    "expected": totals["credits"],
-                    "actual": totals["debits"],
-                })
+        debit = func.coalesce(func.sum(case((LedgerEntry.direction == "DEBIT", LedgerEntry.amount_minor), else_=0)), 0)
+        credit = func.coalesce(func.sum(case((LedgerEntry.direction == "CREDIT", LedgerEntry.amount_minor), else_=0)), 0)
 
-        for wallet in wallets:
-            expected = self.db.query(func.coalesce(func.sum(LedgerEntry.amount_minor), 0)).filter(
-                LedgerEntry.wallet_id == wallet.id,
-                LedgerEntry.direction == "CREDIT"
-            ).scalar() or 0
-            actual_debits = self.db.query(func.coalesce(func.sum(LedgerEntry.amount_minor), 0)).filter(
-                LedgerEntry.wallet_id == wallet.id,
-                LedgerEntry.direction == "DEBIT"
-            ).scalar() or 0
-            expected_balance = expected - actual_debits
-            if wallet.balance_minor != expected_balance:
-                discrepancies.append({
-                    "wallet_id": wallet.id,
-                    "type": "wallet_balance_mismatch",
-                    "expected": expected_balance,
-                    "actual": wallet.balance_minor,
-                })
-
-        prev_hash = "GENESIS"
-        for entry in entries:
-            expected_hash = self._build_entry_hash(prev_hash, entry.transaction_id, entry.wallet_id, entry.direction, entry.amount_minor, entry.currency, entry.created_at)
-            if entry.entry_hash != expected_hash:
-                discrepancies.append({
-                    "wallet_id": entry.wallet_id,
-                    "transaction_id": entry.transaction_id,
-                    "type": "hash_chain_break",
-                    "first_sequence": entry.seq,
-                    "expected": expected_hash,
-                    "actual": entry.entry_hash,
-                })
+        # (a) every transaction balances; transactions must have entries
+        per_txn = {tid: (d, c) for tid, d, c in db.execute(select(LedgerEntry.transaction_id, debit, credit).group_by(LedgerEntry.transaction_id))}
+        txn_ids = [t for (t,) in db.execute(select(LedgerTransaction.id))]
+        for tid in txn_ids:
+            d, c = per_txn.get(tid, (0, 0))
+            if d != c or tid not in per_txn:
+                problem("transaction_unbalanced", expected=c, actual=d, transaction_id=tid)
+        # (b) whole ledger balances
+        total_d, total_c = db.execute(select(debit, credit)).one()
+        if total_d != total_c:
+            problem("ledger_unbalanced", expected=total_c, actual=total_d)
+        # (c) wallet balance == credits - debits
+        per_wallet = {wid: c - d for wid, d, c in db.execute(select(LedgerEntry.wallet_id, debit, credit).group_by(LedgerEntry.wallet_id))}
+        wallets = db.query(Wallet).all()
+        for w in wallets:
+            expected = per_wallet.get(w.id, 0)
+            if w.balance_minor != expected:
+                problem("wallet_balance_mismatch", expected=expected, actual=w.balance_minor, wallet_id=w.id)
+        # (d) all balances of one currency (funding wallet included) sum to zero
+        sums: dict[str, int] = {}
+        for w in wallets:
+            sums[w.currency] = sums.get(w.currency, 0) + w.balance_minor
+        for currency, total in sums.items():
+            if total != 0:
+                problem("currency_sum_nonzero", expected=0, actual=total, currency=currency)
+        # (e) hash chain: report the first broken sequence number
+        prev = GENESIS_HASH
+        entries = db.query(LedgerEntry).order_by(LedgerEntry.seq.asc()).all()
+        for e in entries:
+            expected_hash = entry_hash(prev, e.transaction_id, e.wallet_id, e.direction, e.amount_minor, e.currency, e.created_at)
+            if e.prev_hash != prev or e.entry_hash != expected_hash:
+                problem("hash_chain_break", expected=expected_hash, actual=e.entry_hash, seq=e.seq,
+                        wallet_id=e.wallet_id, transaction_id=e.transaction_id)
                 break
-            prev_hash = entry.entry_hash
+            prev = e.entry_hash
 
-        status = "PASS" if not discrepancies else "FAIL"
-        return {
-            "status": status,
-            "transactions_checked": transactions,
-            "entries_checked": len(entries),
-            "wallets_checked": len(wallets),
-            "discrepancies": discrepancies,
-        }
+        return {"status": "PASS" if not problems else "FAIL", "transactions_checked": len(txn_ids),
+                "entries_checked": len(entries), "wallets_checked": len(wallets), "discrepancies": problems}
+
+
+def entry_to_dict(e: LedgerEntry) -> dict[str, Any]:
+    return {"seq": e.seq, "transaction_id": e.transaction_id, "wallet_id": e.wallet_id, "direction": e.direction,
+            "amount_minor": e.amount_minor, "currency": e.currency, "prev_hash": e.prev_hash,
+            "entry_hash": e.entry_hash, "created_at": e.created_at.isoformat() if e.created_at else None}

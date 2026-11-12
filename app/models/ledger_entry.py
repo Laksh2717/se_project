@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String
+from sqlalchemy import CheckConstraint, Column, DateTime, ForeignKey, Integer, String
 from sqlalchemy.sql import func
 
 from app.database import Base
@@ -6,6 +6,10 @@ from app.database import Base
 
 class LedgerEntry(Base):
     __tablename__ = "ledger_entries"
+    __table_args__ = (
+        CheckConstraint("amount_minor > 0", name="ck_entry_amount_positive"),
+        CheckConstraint("direction IN ('DEBIT','CREDIT')", name="ck_entry_direction"),
+    )
 
     seq = Column(Integer, primary_key=True, autoincrement=True)
     transaction_id = Column(String, ForeignKey("ledger_transactions.id"), nullable=False)

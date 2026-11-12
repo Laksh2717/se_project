@@ -1,39 +1,23 @@
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
+
+from app.core.constants import MAX_AMOUNT_MINOR
+from app.schemas.common import CurrencyCode, UuidStr
+
+# StrictInt rejects 10.5, 10.0, "10" and true; gt/le reject 0, negatives and absurd amounts.
+AmountMinor = StrictInt
 
 
 class DepositRequest(BaseModel):
-    wallet_id: str
-    amount_minor: int = Field(gt=0)
-    currency: str
+    model_config = ConfigDict(extra="forbid")
 
-    @field_validator("currency")
-    @classmethod
-    def validate_currency(cls, value: str) -> str:
-        normalized = value.strip().upper()
-        if len(normalized) != 3 or not normalized.isalpha():
-            raise ValueError("currency must be a 3-letter ISO code")
-        return normalized
+    amount_minor: AmountMinor = Field(gt=0, le=MAX_AMOUNT_MINOR)
+    currency: CurrencyCode
 
 
 class TransferRequest(BaseModel):
-    source_wallet_id: str
-    destination_wallet_id: str
-    amount_minor: int = Field(gt=0)
-    currency: str
-    idempotency_key: str | None = None
+    model_config = ConfigDict(extra="forbid")
 
-    @field_validator("currency")
-    @classmethod
-    def validate_currency(cls, value: str) -> str:
-        normalized = value.strip().upper()
-        if len(normalized) != 3 or not normalized.isalpha():
-            raise ValueError("currency must be a 3-letter ISO code")
-        return normalized
-
-
-class TransferResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    transaction_id: str
-    status: str
-    message: str
+    source_wallet_id: UuidStr
+    destination_wallet_id: UuidStr
+    amount_minor: AmountMinor = Field(gt=0, le=MAX_AMOUNT_MINOR)
+    currency: CurrencyCode

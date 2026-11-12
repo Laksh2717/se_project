@@ -1,10 +1,13 @@
 from pydantic import BaseModel, ConfigDict
 
+from app.schemas.common import CurrencyCode, UuidStr
+
 
 class WalletCreate(BaseModel):
-    user_id: str
-    currency: str
-    is_system: bool = False
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: UuidStr
+    currency: CurrencyCode
 
 
 class WalletRead(BaseModel):
